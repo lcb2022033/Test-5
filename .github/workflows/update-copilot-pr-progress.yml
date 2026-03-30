@@ -1,0 +1,301 @@
+name: Update Copilot PR Progress
+
+# ──────────────────────────────────────────────────────────────
+# This workflow tracks the progress of Copilot fix PRs that
+# target Dependabot branches, and keeps the PR description
+# up to date with a live checklist so you know exactly when
+# the PR is ready to merge.
+#
+# Triggers:
+#   • When the "Tests" CI workflow starts running (in_progress)
+#     → marks CI as "running" in the checklist
+#   • When the "Tests" CI workflow finishes (completed)
+#     → marks CI as passed ✅ or failed ❌ and shows merge readiness
+# ──────────────────────────────────────────────────────────────
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [in_progress, completed, requested]
+
+# No permissions on the workflow itself — all API calls use
+# GH_PAT_FOR_COPILOT (same PAT used by the trigger workflow).
+permissions: {}
+
+# Prevent parallel updates to the same PR
+concurrency:
+  group: copilot-progress-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  update-progress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # ── Step 1: Find the Copilot fix PR for this CI run ───────
+      - name: Find Copilot PR targeting a Dependabot branch
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          echo "🔍 Looking for Copilot fix PR related to branch '${HEAD_BRANCH}'..."
+
+          # The Copilot fix PR has:
+          #   head.ref = copilot/sub-pr-*   (starts with "copilot/")
+          #   base.ref = dependabot/*        (starts with "dependabot/")
+          #
+          # CI can trigger for EITHER branch:
+          #   • Copilot branch CI  → head_branch == PR .head.ref
+          #   • Dependabot branch CI → head_branch == PR .base.ref
+          # So we match if head_branch equals EITHER side of the PR.
+          PR_DATA=$(gh api --paginate --slurp "repos/${REPO}/pulls?state=open" \
+            | jq --arg branch "${HEAD_BRANCH}" \
+              '[flatten[] | select(
+                  (.head.ref | startswith("copilot/")) and
+                  (.base.ref | startswith("dependabot/")) and
+                  (.head.ref == $branch or .base.ref == $branch)
+                )] | .[0]')
+
+          PR_NUMBER=$(echo "${PR_DATA}" | jq -r '.number // empty')
+
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "ℹ️  No Copilot fix PR (copilot/* → dependabot/*) found related to branch '${HEAD_BRANCH}'. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "✅ Found Copilot fix PR #${PR_NUMBER}"
+
+      # ── Step 2: Collect CI check-run statuses ─────────────────
+      - name: Collect CI check statuses
+        if: steps.find_pr.outputs.skip != 'true'
+        id: checks
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+            --jq '.check_runs | map({name, status, conclusion, html_url})' \
+            > /tmp/check_runs.json
+
+          FAILING=$(jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length' /tmp/check_runs.json)
+          PENDING=$(jq '[.[] | select(.status != "completed")] | length' /tmp/check_runs.json)
+          PASSING=$(jq '[.[] | select(.conclusion == "success")] | length' /tmp/check_runs.json)
+          TOTAL=$(jq 'length' /tmp/check_runs.json)
+
+          echo "failing=${FAILING}" >> "$GITHUB_OUTPUT"
+          echo "pending=${PENDING}" >> "$GITHUB_OUTPUT"
+          echo "passing=${PASSING}" >> "$GITHUB_OUTPUT"
+          echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+
+          echo "📊 Checks — total: ${TOTAL}, passing: ${PASSING}, failing: ${FAILING}, pending: ${PENDING}"
+
+      # ── Step 3: Build & update the PR progress checklist ──────
+      - name: Update PR description with progress checklist
+        if: steps.find_pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          CI_STATUS: ${{ github.event.workflow_run.status }}
+          CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          FAILING: ${{ steps.checks.outputs.failing }}
+          PENDING: ${{ steps.checks.outputs.pending }}
+          PASSING: ${{ steps.checks.outputs.passing }}
+          TOTAL: ${{ steps.checks.outputs.total }}
+          UPDATED_AT: ${{ github.event.workflow_run.updated_at }}
+        run: |
+          set -euo pipefail
+
+          # ── Build per-check-run list rows via Python ───────────
+          python3 <<'PYEOF'
+          import json
+
+          data = json.load(open('/tmp/check_runs.json'))
+          rows = []
+          for c in data:
+              name = c['name']
+              url  = c['html_url']
+              if c['conclusion'] == 'success':
+                  rows.append(f'- [x] ✅ {name}')
+              elif c['conclusion'] in ('failure', 'timed_out'):
+                  rows.append(f'- [ ] ❌ {name} — [view logs]({url})')
+              elif c['status'] != 'completed':
+                  rows.append(f'- [ ] ⏳ {name} (running...)')
+              else:
+                  state = c.get('conclusion') or c.get('status', 'unknown')
+                  rows.append(f'- [ ] ⬜ {name} ({state})')
+
+          output = '\n'.join(rows) if rows else '- [ ] ⏳ Waiting for checks to start...'
+          with open('/tmp/check_rows.txt', 'w') as f:
+              f.write(output)
+          PYEOF
+
+          # ── Determine overall readiness ────────────────────────
+          FAILING_INT=$((FAILING))
+          PENDING_INT=$((PENDING))
+          TOTAL_INT=$((TOTAL))
+
+          if [[ "${FAILING_INT}" -eq 0 && "${PENDING_INT}" -eq 0 && "${TOTAL_INT}" -gt 0 ]]; then
+            READY_EMOJI="✅"
+            READY_HEADER="Ready to Merge"
+            READY_MSG="All CI checks have passed. This PR can be merged into the Dependabot branch."
+            MERGE_STEP="- [x] 🎉 Merge this PR into the Dependabot branch"
+          elif [[ "${FAILING_INT}" -gt 0 ]]; then
+            READY_EMOJI="❌"
+            READY_HEADER="Not Ready — CI is Failing"
+            READY_MSG="CI is still failing. The automated retry system will post another \`@copilot\` comment on the Dependabot PR to trigger a new fix attempt."
+            MERGE_STEP="- [ ] 🔀 Merge this PR into the Dependabot branch (blocked by failing checks)"
+          else
+            READY_EMOJI="⏳"
+            READY_HEADER="Waiting for CI"
+            READY_MSG="CI checks are still running. This section will update automatically when they finish."
+            MERGE_STEP="- [ ] 🔀 Merge this PR into the Dependabot branch (waiting for CI)"
+          fi
+
+          # ── CI step row ────────────────────────────────────────
+          if [[ "${CI_CONCLUSION}" == "success" ]]; then
+            CI_STEP="- [x] ✅ CI **${WORKFLOW_NAME}** passed — [view run](${RUN_URL})"
+          elif [[ "${CI_CONCLUSION}" == "failure" ]]; then
+            CI_STEP="- [ ] ❌ CI **${WORKFLOW_NAME}** failed — [view run](${RUN_URL})"
+          else
+            CI_STEP="- [ ] ⏳ CI **${WORKFLOW_NAME}** in progress — [view run](${RUN_URL})"
+          fi
+
+          # ── Export shell vars so Python can read them via os.environ ─
+          export READY_EMOJI READY_HEADER READY_MSG MERGE_STEP CI_STEP
+
+          # ── Fetch current PR body before Python runs ───────────
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' \
+            > /tmp/current_body.txt
+
+          # ── Build progress section and update PR body via Python ──
+          python3 <<'PYEOF'
+          import os, re
+
+          ready_emoji   = os.environ['READY_EMOJI']
+          ready_header  = os.environ['READY_HEADER']
+          ready_msg     = os.environ['READY_MSG']
+          merge_step    = os.environ['MERGE_STEP']
+          ci_step       = os.environ['CI_STEP']
+          run_url       = os.environ['RUN_URL']
+          updated_at    = os.environ['UPDATED_AT']
+
+          check_rows = open('/tmp/check_rows.txt').read().strip()
+
+          # Format timestamp to a human-friendly string, e.g. "2026-03-24 06:05 UTC"
+          try:
+              from datetime import timezone
+              from datetime import datetime as dt
+              ts = dt.fromisoformat(updated_at.replace('Z', '+00:00'))
+              updated_at = ts.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+          except Exception:
+              pass  # keep original string if parsing fails
+
+          lines = [
+              '<!-- copilot-progress-start -->',
+              '',
+              '## \U0001f916 Copilot Fix \u2014 Progress Tracker',
+              '',
+              f'### {ready_emoji} {ready_header}',
+              '',
+              ready_msg,
+              '',
+              '#### CI Checks',
+              '',
+              check_rows,
+              '',
+              '#### Steps',
+              '',
+              '- [x] \U0001f916 Copilot created this fix PR',
+              ci_step,
+              merge_step,
+              '',
+              f'<sub>_Last updated: {updated_at} \u00b7 [CI run]({run_url})_</sub>',
+              '',
+              '<!-- copilot-progress-end -->',
+          ]
+          progress = '\n'.join(lines)
+
+          with open('/tmp/current_body.txt') as f:
+              body = f.read()
+
+          # Remove any existing progress section
+          body = re.sub(
+              r'<!-- copilot-progress-start -->.*?<!-- copilot-progress-end -->',
+              '',
+              body,
+              flags=re.DOTALL,
+          ).rstrip()
+
+          new_body = (body + '\n\n' + progress).strip() if body.strip() else progress.strip()
+
+          with open('/tmp/new_body.txt', 'w') as f:
+              f.write(new_body)
+          PYEOF
+
+          # ── Patch the PR via the GitHub API ───────────────────
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --method PATCH \
+            --field body=@/tmp/new_body.txt
+
+          echo "✅ Updated PR #${PR_NUMBER} — ${READY_EMOJI} ${READY_HEADER}"
+
+      # ── Step 4: Add 'Ready to merge' label when all checks pass ──
+      - name: Add 'Ready to merge' label
+        if: |
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.checks.outputs.failing == '0' &&
+          steps.checks.outputs.pending == '0' &&
+          steps.checks.outputs.total != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Ensure the label exists (idempotent)
+          gh api "repos/${REPO}/labels" \
+            --method POST \
+            --field name="Ready to merge ✅" \
+            --field color="0e8a16" \
+            --field description="All CI checks passed — safe to merge" \
+            2>/dev/null || true
+
+          # Add the label to the PR
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --method POST \
+            --input - <<< '{"labels":["Ready to merge ✅"]}'
+
+          echo "🏷️  Added 'Ready to merge ✅' label to PR #${PR_NUMBER}"
+
+      # ── Step 5: Remove 'Ready to merge' label if CI is not green ──
+      - name: Remove 'Ready to merge' label if CI is failing or pending
+        if: |
+          steps.find_pr.outputs.skip != 'true' &&
+          (steps.checks.outputs.failing != '0' || steps.checks.outputs.pending != '0')
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Remove the label if it exists (ignore error if not present)
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels/Ready%20to%20merge%20%E2%9C%85" \
+            --method DELETE 2>/dev/null || true
+
+          echo "🏷️  Removed 'Ready to merge ✅' label from PR #${PR_NUMBER} (if it existed)"

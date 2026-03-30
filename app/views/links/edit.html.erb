@@ -1,0 +1,10 @@
+<%= link_to "<-Back", root_path, class: "text-blue-600 no-underline" %>
+<h1>Edit Link</h1>
+
+<%= render partial: "form", locals: { link: @link } %>
+
+<div class="flex gap-1 mt-4">
+  <%= link_to "Cancel", @link %>
+  or
+  <%= button_to "Delete", @link, method: :delete, data: { turbo_confirm: "Are you sure?" } %>
+</div>

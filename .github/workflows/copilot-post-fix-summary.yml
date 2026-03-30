@@ -1,0 +1,521 @@
+name: copilot-post-fix-summary
+
+# ──────────────────────────────────────────────────────────────
+# Triggers when CI PASSES on a Dependabot branch.
+# If Copilot made fix attempts on that PR, this workflow collects
+# all attempt data and posts a structured fix summary comment.
+#
+# Use case: experiment tracking for gem upgrades — know exactly
+# what broke, what Copilot tried, what worked, and how many
+# attempts it took.
+# ──────────────────────────────────────────────────────────────
+on:
+  workflow_run:
+    workflows: ["Run Rspec", "Run RuboCop"]
+    types: [completed]
+    branches:
+      - 'dependabot/**'
+
+permissions: {}
+
+env:
+  COPILOT_MARKER: "<!-- copilot-fix-attempt -->"
+  CONTROLLER_STATE_MARKER: "<!-- copilot-controller-state -->"
+  COPILOT_PROGRESS_MARKER: "<!-- copilot-fix-progress -->"
+  SUMMARY_MARKER: "<!-- copilot-fix-summary -->"
+
+concurrency:
+  group: copilot-summary-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  post-summary:
+    # Only when CI SUCCEEDED on a Dependabot PR branch
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # ── Step 1: Resolve the PR number ─────────────────────────
+      - name: Resolve PR number
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER=$(gh api "repos/${REPO}/pulls" \
+            --method GET \
+            -f head="${REPO%%/*}:${BRANCH}" \
+            -f state=open \
+            --jq '.[0].number // empty')
+
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "⚠️  No open PR found for branch ${BRANCH}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "✅ Found PR #${PR_NUMBER}"
+
+      # ── Step 2: Check if Copilot was involved ─────────────────
+      - name: Check for Copilot fix attempts
+        if: steps.find_pr.outputs.skip != 'true'
+        id: check_copilot
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Count Copilot trigger comments
+          RAW_COUNT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"${COPILOT_MARKER}\"))] | length" \
+            | paste -sd+ -)
+          ATTEMPT_COUNT=$(( ${RAW_COUNT:-0} ))
+
+          if [[ "${ATTEMPT_COUNT}" -eq 0 ]]; then
+            echo "ℹ️  No Copilot fix attempts found on PR #${PR_NUMBER}. Skipping summary."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "attempt_count=${ATTEMPT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "📊 Found ${ATTEMPT_COUNT} Copilot fix attempt(s) on PR #${PR_NUMBER}"
+
+      # ── Step 3: Check if summary already posted ───────────────
+      - name: Check for existing summary
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_copilot.outputs.skip != 'true'
+        id: check_summary
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          RAW_EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"${SUMMARY_MARKER}\"))] | length" \
+            | paste -sd+ -)
+          EXISTING=$(( ${RAW_EXISTING:-0} ))
+
+          if [[ "${EXISTING}" -gt 0 ]]; then
+            echo "ℹ️  Fix summary already posted. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 4: Gather all fix attempt data ───────────────────
+      - name: Gather fix data
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_copilot.outputs.skip != 'true' &&
+          steps.check_summary.outputs.skip != 'true'
+        id: gather
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          # ── 4a: Fetch PR metadata ──
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          PR_TITLE=$(echo "${PR_DATA}" | jq -r '.title')
+          PR_URL=$(echo "${PR_DATA}" | jq -r '.html_url')
+          PR_AUTHOR=$(echo "${PR_DATA}" | jq -r '.user.login')
+
+          echo "pr_title=${PR_TITLE}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+          # ── 4b: Fetch controller state (final metrics) ──
+          STATE_BODY=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${CONTROLLER_STATE_MARKER}\"))] | last // empty | .body" \
+            || echo ''
+          )
+
+          STATE_JSON=""
+          if [[ -n "${STATE_BODY:-}" ]]; then
+            STATE_JSON=$(echo "${STATE_BODY}" | sed -n '/```json/,/```/{/```/d;p}' || echo '')
+          fi
+
+          if [[ -n "${STATE_JSON:-}" ]] && echo "${STATE_JSON}" | jq empty 2>/dev/null; then
+            echo "${STATE_JSON}" > /tmp/final_state.json
+            FINAL_ATTEMPT=$(echo "${STATE_JSON}" | jq -r '.attempt // "?"')
+            FINAL_FAILED_JOBS=$(echo "${STATE_JSON}" | jq -r '.failed_job_count // "?"')
+            FINAL_ERROR_SIGS=$(echo "${STATE_JSON}" | jq -r '.error_signature_count // "?"')
+            FINAL_STALL_STREAK=$(echo "${STATE_JSON}" | jq -r '.stall_streak // 0')
+          else
+            FINAL_ATTEMPT="?"
+            FINAL_FAILED_JOBS="?"
+            FINAL_ERROR_SIGS="?"
+            FINAL_STALL_STREAK="0"
+            echo '{}' > /tmp/final_state.json
+          fi
+
+          echo "final_attempt=${FINAL_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "final_failed_jobs=${FINAL_FAILED_JOBS}" >> "$GITHUB_OUTPUT"
+          echo "final_error_sigs=${FINAL_ERROR_SIGS}" >> "$GITHUB_OUTPUT"
+          echo "final_stall_streak=${FINAL_STALL_STREAK}" >> "$GITHUB_OUTPUT"
+
+          # ── 4c: Fetch gem change summary ──
+          GEM_SUMMARY=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq '[.[] | select(.body | contains("## Dependency change summary"))] | last // empty | .body' \
+            || echo ''
+          )
+
+          if [[ -n "${GEM_SUMMARY:-}" ]]; then
+            echo "${GEM_SUMMARY}" > /tmp/gem_summary.md
+            echo "has_gem_summary=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_gem_summary=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # ── 4d: Find all Copilot fix PRs that targeted this branch ──
+          # These are PRs where base branch = dependabot branch and author is copilot or title matches
+          FIX_PRS=$(gh api "repos/${REPO}/pulls?state=all&base=${BRANCH}&per_page=100" \
+            --jq '[.[] | select(
+              (.title | test("AI GEM UPGRADE"; "i")) or
+              (.user.login | test("copilot"; "i")) or
+              (.head.ref | test("copilot"; "i"))
+            ) | {
+              number: .number,
+              title: .title,
+              state: .state,
+              merged: .merged_at != null,
+              author: .user.login,
+              url: .html_url,
+              created_at: .created_at,
+              files_changed: .changed_files
+            }]' 2>/dev/null || echo '[]')
+
+          echo "${FIX_PRS}" > /tmp/fix_prs.json
+          FIX_PR_COUNT=$(echo "${FIX_PRS}" | jq 'length')
+          echo "fix_pr_count=${FIX_PR_COUNT}" >> "$GITHUB_OUTPUT"
+
+          # ── 4e: Extract error signatures from the last trigger comment ──
+          LAST_TRIGGER=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${COPILOT_MARKER}\"))] | last // empty | .body" \
+            || echo ''
+          )
+
+          # Extract error signatures block from the last trigger comment
+          LAST_ERRORS=""
+          if [[ -n "${LAST_TRIGGER:-}" ]]; then
+            LAST_ERRORS=$(echo "${LAST_TRIGGER}" | sed -n '/Detected error signatures/,/```/{/```/!p}' | sed '/Detected error signatures/d' || echo '')
+          fi
+
+          if [[ -n "${LAST_ERRORS:-}" ]]; then
+            echo "${LAST_ERRORS}" > /tmp/last_errors.txt
+          else
+            echo "No error signatures captured." > /tmp/last_errors.txt
+          fi
+
+          # ── 4f: Extract failed jobs from the last trigger comment ──
+          LAST_FAILED_JOBS=""
+          if [[ -n "${LAST_TRIGGER:-}" ]]; then
+            LAST_FAILED_JOBS=$(echo "${LAST_TRIGGER}" | sed -n '/Failed jobs:/,/```/{/```/!p}' | sed '/Failed jobs:/d' | head -50 || echo '')
+          fi
+
+          if [[ -n "${LAST_FAILED_JOBS:-}" ]]; then
+            echo "${LAST_FAILED_JOBS}" > /tmp/last_failed_jobs.txt
+          else
+            echo "No failed jobs data captured." > /tmp/last_failed_jobs.txt
+          fi
+
+          # ── 4g: Fetch Copilot progress checklist (what Copilot reported doing) ──
+          PROGRESS_BODY=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${COPILOT_PROGRESS_MARKER}\"))] | last // empty | .body" \
+            || echo ''
+          )
+
+          if [[ -n "${PROGRESS_BODY:-}" ]]; then
+            echo "${PROGRESS_BODY}" > /tmp/progress_checklist.md
+            echo "has_progress=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_progress=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # ── 4h: Collect files changed across all fix PRs ──
+          ALL_CHANGED_FILES="[]"
+          while read -r FIX_PR_NUM; do
+            [[ -z "${FIX_PR_NUM:-}" || "${FIX_PR_NUM}" == "null" ]] && continue
+            PR_FILES=$(gh api "repos/${REPO}/pulls/${FIX_PR_NUM}/files" \
+              --jq '[.[] | {filename: .filename, status: .status, additions: .additions, deletions: .deletions}]' \
+              2>/dev/null || echo '[]')
+            ALL_CHANGED_FILES=$(echo "${ALL_CHANGED_FILES}" "${PR_FILES}" | jq -s 'add | unique_by(.filename)')
+          done < <(echo "${FIX_PRS}" | jq -r '.[].number')
+
+          echo "${ALL_CHANGED_FILES}" > /tmp/all_changed_files.json
+          TOTAL_FILES_CHANGED=$(echo "${ALL_CHANGED_FILES}" | jq 'length')
+          echo "total_files_changed=${TOTAL_FILES_CHANGED}" >> "$GITHUB_OUTPUT"
+
+      # ── Step 5: Build & post the summary ──────────────────────
+      - name: Post fix summary
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_copilot.outputs.skip != 'true' &&
+          steps.check_summary.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          ATTEMPT_COUNT: ${{ steps.check_copilot.outputs.attempt_count }}
+          PR_TITLE: ${{ steps.gather.outputs.pr_title }}
+          PR_URL: ${{ steps.gather.outputs.pr_url }}
+          FINAL_ATTEMPT: ${{ steps.gather.outputs.final_attempt }}
+          FINAL_FAILED_JOBS: ${{ steps.gather.outputs.final_failed_jobs }}
+          FINAL_ERROR_SIGS: ${{ steps.gather.outputs.final_error_sigs }}
+          FINAL_STALL_STREAK: ${{ steps.gather.outputs.final_stall_streak }}
+          HAS_GEM_SUMMARY: ${{ steps.gather.outputs.has_gem_summary }}
+          HAS_PROGRESS: ${{ steps.gather.outputs.has_progress }}
+          FIX_PR_COUNT: ${{ steps.gather.outputs.fix_pr_count }}
+          TOTAL_FILES_CHANGED: ${{ steps.gather.outputs.total_files_changed }}
+        run: |
+          set -euo pipefail
+
+          # ── Build fix PR table ──
+          FIX_PR_TABLE=""
+          if [[ -f /tmp/fix_prs.json ]]; then
+            FIX_PR_TABLE=$(jq -r '
+              if length == 0 then "No Copilot fix PRs found."
+              else
+                "| PR | Title | Status | Author | Created |\n|-----|-------|--------|--------|---------|\n" +
+                (map("| [#\(.number)](\(.url)) | \(.title) | \(if .merged then "✅ Merged" elif .state == "open" then "🟡 Open" else "⚫ Closed" end) | @\(.author) | \(.created_at | split("T")[0]) |") | join("\n"))
+              end
+            ' /tmp/fix_prs.json)
+          fi
+
+          # ── Build changed files table ──
+          CHANGED_FILES_TABLE=""
+          if [[ -f /tmp/all_changed_files.json ]]; then
+            CHANGED_FILES_TABLE=$(jq -r '
+              if length == 0 then "No files changed."
+              else
+                "| File | Status | +/- |\n|------|--------|-----|\n" +
+                (map("| `\(.filename)` | \(.status) | +\(.additions) / -\(.deletions) |") | join("\n"))
+              end
+            ' /tmp/all_changed_files.json)
+          fi
+
+          # ── Determine outcome ──
+          OUTCOME="✅ CI is now green"
+          OUTCOME_EMOJI="✅"
+
+          # ── Build the summary comment ──
+          cat > /tmp/summary_comment.md <<SUMMARY_EOF
+          ${SUMMARY_MARKER}
+          ## ${OUTCOME_EMOJI} Copilot Fix Summary — Post-Mortem
+
+          > This is an automated summary of all Copilot fix attempts on this Dependabot PR.
+          > Use this for experiment tracking and to evaluate Copilot's effectiveness.
+
+          ---
+
+          ### 📋 Overview
+
+          | Metric | Value |
+          |--------|-------|
+          | **Dependabot PR** | [#${PR_NUMBER}](${PR_URL}) — ${PR_TITLE} |
+          | **Branch** | \`${BRANCH}\` |
+          | **Outcome** | ${OUTCOME} |
+          | **Total Copilot attempts** | ${ATTEMPT_COUNT} |
+          | **Fix PRs created** | ${FIX_PR_COUNT} |
+          | **Total files changed** | ${TOTAL_FILES_CHANGED} |
+          | **Final stall streak** | ${FINAL_STALL_STREAK} |
+          | **Green CI run** | [View](${RUN_URL}) |
+
+          ---
+
+          ### 📊 Metrics at Last Failure (before final fix)
+
+          | Metric | Value |
+          |--------|-------|
+          | Attempt | #${FINAL_ATTEMPT} |
+          | Failed jobs | ${FINAL_FAILED_JOBS} |
+          | Error signatures | ${FINAL_ERROR_SIGS} |
+          | Stall streak | ${FINAL_STALL_STREAK} |
+
+          ---
+
+          ### 🔧 Copilot Fix PRs
+
+          ${FIX_PR_TABLE}
+
+          ---
+
+          ### 📁 All Files Changed Across Fix PRs
+
+          ${CHANGED_FILES_TABLE}
+
+          ---
+
+          SUMMARY_EOF
+
+          # ── Append gem summary if available ──
+          if [[ "${HAS_GEM_SUMMARY}" == "true" && -f /tmp/gem_summary.md ]]; then
+            cat >> /tmp/summary_comment.md <<GEM_EOF
+
+          ### 💎 Gem Changes That Triggered This
+
+          $(cat /tmp/gem_summary.md)
+
+          ---
+
+          GEM_EOF
+          fi
+
+          # ── Append last known errors ──
+          if [[ -f /tmp/last_errors.txt ]]; then
+            ERRORS_CONTENT=$(cat /tmp/last_errors.txt)
+            if [[ -n "${ERRORS_CONTENT:-}" && "${ERRORS_CONTENT}" != "No error signatures captured." ]]; then
+              cat >> /tmp/summary_comment.md <<ERRORS_EOF
+
+          ### 🐛 Error Signatures (from last failing attempt)
+
+          These were the deduplicated error signatures from the last CI failure before the fix:
+
+          \`\`\`
+          ${ERRORS_CONTENT}
+          \`\`\`
+
+          ---
+
+          ERRORS_EOF
+            fi
+          fi
+
+          # ── Append last failed jobs ──
+          if [[ -f /tmp/last_failed_jobs.txt ]]; then
+            JOBS_CONTENT=$(cat /tmp/last_failed_jobs.txt)
+            if [[ -n "${JOBS_CONTENT:-}" && "${JOBS_CONTENT}" != "No failed jobs data captured." ]]; then
+              cat >> /tmp/summary_comment.md <<JOBS_EOF
+
+          ### 🏗️ Failed Jobs (from last failing attempt)
+
+          \`\`\`json
+          ${JOBS_CONTENT}
+          \`\`\`
+
+          ---
+
+          JOBS_EOF
+            fi
+          fi
+
+          # ── Append Copilot's own progress notes ──
+          if [[ "${HAS_PROGRESS}" == "true" && -f /tmp/progress_checklist.md ]]; then
+            cat >> /tmp/summary_comment.md <<PROGRESS_EOF
+
+          ### 🤖 Copilot's Progress Notes
+
+          <details>
+          <summary>Click to expand Copilot's self-reported progress checklist</summary>
+
+          $(cat /tmp/progress_checklist.md)
+
+          </details>
+
+          ---
+
+          PROGRESS_EOF
+          fi
+
+          # ── Append experiment data JSON block ──
+          EXPERIMENT_JSON=$(jq -n \
+            --arg pr_number "${PR_NUMBER}" \
+            --arg branch "${BRANCH}" \
+            --arg pr_title "${PR_TITLE}" \
+            --argjson attempt_count "${ATTEMPT_COUNT}" \
+            --argjson fix_pr_count "${FIX_PR_COUNT}" \
+            --argjson total_files_changed "${TOTAL_FILES_CHANGED}" \
+            --arg final_attempt "${FINAL_ATTEMPT}" \
+            --arg final_failed_jobs "${FINAL_FAILED_JOBS}" \
+            --arg final_error_sigs "${FINAL_ERROR_SIGS}" \
+            --arg final_stall_streak "${FINAL_STALL_STREAK}" \
+            --arg outcome "ci_green" \
+            --arg green_run_url "${RUN_URL}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              pr_number: $pr_number,
+              branch: $branch,
+              pr_title: $pr_title,
+              outcome: $outcome,
+              total_attempts: $attempt_count,
+              fix_prs_created: $fix_pr_count,
+              total_files_changed: $total_files_changed,
+              last_failure_state: {
+                attempt: $final_attempt,
+                failed_jobs: $final_failed_jobs,
+                error_signatures: $final_error_sigs,
+                stall_streak: $final_stall_streak
+              },
+              green_run_url: $green_run_url,
+              completed_at: $timestamp
+            }')
+
+          cat >> /tmp/summary_comment.md <<DATA_EOF
+
+          ### 🧪 Experiment Data (machine-readable)
+
+          > Use this JSON block for tracking Copilot fix effectiveness across PRs.
+
+          \`\`\`json
+          ${EXPERIMENT_JSON}
+          \`\`\`
+
+          ---
+          _This summary was auto-generated by the Copilot post-fix summary workflow._
+          DATA_EOF
+
+          # ── Post the summary comment ──
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/summary_comment.md
+
+          echo "✅ Posted fix summary on PR #${PR_NUMBER}"
+
+      # ── Step 6: Add summary label ─────────────────────────────
+      - name: Add summary label
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_copilot.outputs.skip != 'true' &&
+          steps.check_summary.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Ensure label exists
+          gh api "repos/${REPO}/labels" \
+            --method POST \
+            --field name="copilot-fix-complete" \
+            --field color="0e8a16" \
+            --field description="Copilot successfully fixed CI on this Dependabot PR" \
+            2>/dev/null || true
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --method POST \
+            --input - <<< '{"labels":["copilot-fix-complete"]}'
+
+          echo "✅ Added 'copilot-fix-complete' label to PR #${PR_NUMBER}"

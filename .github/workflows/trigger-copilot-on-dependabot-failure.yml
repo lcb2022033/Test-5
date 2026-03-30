@@ -1,0 +1,869 @@
+name: trigger-copilot-on-dependabot-failure
+
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches:
+      - 'dependabot/**'
+
+# ──────────────────────────────────────────────────────────────
+# Least-privilege permissions — all API calls use GH_PAT_FOR_COPILOT
+# ──────────────────────────────────────────────────────────────
+permissions: {}
+
+# ──────────────────────────────────────────────────────────────
+# Max retry iterations before giving up (prevents infinite loops)
+# ──────────────────────────────────────────────────────────────
+env:
+  MAX_COPILOT_RETRIES: "6"
+  MAX_STALL_ATTEMPTS: "3"          # switch to ESCALATED prompt after this many consecutive no-improvement attempts
+  COPILOT_MARKER: "<!-- copilot-fix-attempt -->"
+  COPILOT_PROGRESS_MARKER: "<!-- copilot-fix-progress -->"
+  MAX_REACHED_MARKER: "<!-- copilot-fix-max-reached -->"
+  CONTROLLER_STATE_MARKER: "<!-- copilot-controller-state -->"
+
+# ──────────────────────────────────────────────────────────────
+# Prevent parallel runs for the same Dependabot branch
+# ──────────────────────────────────────────────────────────────
+concurrency:
+  group: copilot-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  trigger-copilot:
+    # Only when the Tests workflow FAILED on a Dependabot PR branch
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── Step 1: Resolve the PR number ─────────────────────────
+      - name: Resolve PR number
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER=$(gh api "repos/${REPO}/pulls" \
+            --method GET \
+            -f head="${REPO%%/*}:${BRANCH}" \
+            -f state=open \
+            --jq '.[0].number // empty')
+
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "⚠️  No open PR found for branch ${BRANCH}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "✅ Found PR #${PR_NUMBER}"
+
+      # ── Step 2: Count previous Copilot attempts ───────────────
+      - name: Count previous attempts
+        if: steps.find_pr.outputs.skip != 'true'
+        id: count
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Paginate all comments to get an accurate count
+          RAW_COUNT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$COPILOT_MARKER\"))] | length" \
+            | paste -sd+ -)
+          ATTEMPT_COUNT=$(( ${RAW_COUNT:-0} + 1 ))
+          echo "attempt=${ATTEMPT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "📊 Copilot fix attempt #${ATTEMPT_COUNT} (max: ${MAX_COPILOT_RETRIES})"
+
+      # ── Step 3: Gate on retry limit ───────────────────────────
+      - name: Check retry limit
+        if: steps.find_pr.outputs.skip != 'true'
+        id: check_limit
+        env:
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${ATTEMPT}" -gt "${MAX_COPILOT_RETRIES}" ]]; then
+            echo "🛑 Max retries (${MAX_COPILOT_RETRIES}) exceeded. Stopping."
+            echo "exceeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exceeded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 4: Post max-retry notice (idempotent) ────────────
+      - name: Post max-retry notice
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          # Skip if we already posted a max-reached notice
+          RAW_EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$MAX_REACHED_MARKER\"))] | length" \
+            | paste -sd+ -)
+          EXISTING=$(( ${RAW_EXISTING:-0} ))
+
+          if [[ "${EXISTING}" -gt 0 ]]; then
+            echo "ℹ️  Max-reached notice already posted. Skipping duplicate."
+            exit 0
+          fi
+
+          cat > /tmp/max_reached_body.md <<MAX_NOTICE_EOF
+          ${MAX_REACHED_MARKER}
+          ## 🛑 Automated fix limit reached
+          MAX_NOTICE_EOF
+
+          cat >> /tmp/max_reached_body.md <<MAX_NOTICE_EOF
+
+          Copilot has attempted **${MAX_COPILOT_RETRIES}** fixes and CI is still failing.
+
+          **Manual intervention is required.** Please review:
+          - The latest [failing CI run](${RUN_URL})
+          - Previous Copilot fix PRs on this branch
+
+          Consider:
+          1. Manually fixing the remaining issues
+          2. Closing this Dependabot PR if the upgrade isn't feasible right now
+          3. Increasing \`MAX_COPILOT_RETRIES\` if Copilot was making progress
+          MAX_NOTICE_EOF
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/max_reached_body.md
+
+      # ── Step 5: Fetch CI failure logs ─────────────────────────
+      - name: Fetch failure logs
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # ── Structured failed-job metadata ──
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure")
+                   | {name: .name,
+                      steps: [.steps[] | select(.conclusion == "failure") | .name]}]' \
+            > /tmp/failed_jobs.json
+
+          echo "::group::Failed jobs JSON"
+          cat /tmp/failed_jobs.json
+          echo "::endgroup::"
+
+          # ── Error logs from failed jobs (max 4,000 lines / 30,000 chars total) ──
+          : > /tmp/failure_logs.txt   # truncate
+
+          MAX_TOTAL_LINES=4000
+          MAX_TOTAL_CHARS=30000
+          TOTAL_LINES=0
+          TOTAL_CHARS=0
+          INCLUDED_JOBS=0
+          SKIPPED_JOBS=0
+
+          FAILED_JOBS=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"')
+
+          if [[ -z "${FAILED_JOBS:-}" ]]; then
+            echo "No failed jobs found for run ${RUN_ID}." > /tmp/failure_logs.txt
+          else
+            while IFS=$'\t' read -r FAILED_JOB_ID FAILED_JOB_NAME; do
+              [[ -z "${FAILED_JOB_ID:-}" ]] && continue
+
+              if ! gh api "repos/${REPO}/actions/jobs/${FAILED_JOB_ID}/logs" > /tmp/failed_job_full.log 2>/dev/null; then
+                continue
+              fi
+
+              printf -- '--- Job %s (%s) ---\n\n' "${FAILED_JOB_ID}" "${FAILED_JOB_NAME:-unknown}" > /tmp/job_header.txt
+
+              HEADER_LINES=$(wc -l < /tmp/job_header.txt | tr -d ' ')
+              HEADER_CHARS=$(wc -c < /tmp/job_header.txt | tr -d ' ')
+              REMAINING_LINES=$(( MAX_TOTAL_LINES - TOTAL_LINES ))
+              REMAINING_CHARS=$(( MAX_TOTAL_CHARS - TOTAL_CHARS ))
+
+              if [[ "${HEADER_LINES}" -gt "${REMAINING_LINES}" || "${HEADER_CHARS}" -gt "${REMAINING_CHARS}" ]]; then
+                break
+              fi
+
+              REMAINING_JOB_LINES=$(( REMAINING_LINES - HEADER_LINES ))
+              REMAINING_JOB_CHARS=$(( REMAINING_CHARS - HEADER_CHARS ))
+
+              awk -v max_lines="${REMAINING_JOB_LINES}" -v max_chars="${REMAINING_JOB_CHARS}" '
+                BEGIN {
+                  IGNORECASE=1
+                  in_block=0
+                  block_count=0
+                  found_any=0
+                  included_any=0
+                  total_lines=0
+                  total_chars=0
+                  truncated=0
+                }
+
+                function block_chars(  i, c) {
+                  c=0
+                  for (i = 1; i <= block_count; i++) c += length(block[i]) + 1
+                  return c
+                }
+
+                function flush_block(  i, block_lines, block_chars_count) {
+                  if (block_count == 0) return
+
+                  block_lines = block_count + 1
+                  block_chars_count = block_chars() + 1
+
+                  if ((total_lines + block_lines) <= max_lines && (total_chars + block_chars_count) <= max_chars) {
+                    for (i = 1; i <= block_count; i++) print block[i]
+                    print ""
+                    total_lines += block_lines
+                    total_chars += block_chars_count
+                    included_any=1
+                  } else {
+                    truncated=1
+                  }
+
+                  delete block
+                  block_count=0
+                }
+
+                {
+                  line = $0
+
+                  if (line ~ /(error|exception|traceback|fatal|failed|failure)/) {
+                    found_any=1
+                    if (!in_block) {
+                      in_block=1
+                      block_count=0
+                    }
+                    block[++block_count] = line
+                    next
+                  }
+
+                  if (in_block) {
+                    if (line ~ /^$/ || line ~ /^##\[group\]/ || line ~ /^##\[endgroup\]/ || line ~ /^\+\s*\w/) {
+                      flush_block()
+                      in_block=0
+                      next
+                    }
+                    block[++block_count] = line
+                    next
+                  }
+                }
+
+                END {
+                  if (in_block) flush_block()
+
+                  if (!found_any) {
+                    print "No error-pattern blocks found for this job."
+                    print ""
+                  } else if (!included_any) {
+                    print "No complete error block could fit within the remaining size budget for this job."
+                    print ""
+                  }
+
+                  if (truncated) {
+                    print "[NOTE] Additional error blocks were omitted to stay within size limits."
+                    print ""
+                  }
+                }
+              ' /tmp/failed_job_full.log > /tmp/job_error_blocks.txt
+
+              {
+                cat /tmp/job_header.txt
+                cat /tmp/job_error_blocks.txt
+              } > /tmp/job_section.txt
+
+              JOB_SECTION_LINES=$(wc -l < /tmp/job_section.txt | tr -d ' ')
+              JOB_SECTION_CHARS=$(wc -c < /tmp/job_section.txt | tr -d ' ')
+              REMAINING_LINES=$(( MAX_TOTAL_LINES - TOTAL_LINES ))
+              REMAINING_CHARS=$(( MAX_TOTAL_CHARS - TOTAL_CHARS ))
+
+              if [[ "${JOB_SECTION_LINES}" -le "${REMAINING_LINES}" && "${JOB_SECTION_CHARS}" -le "${REMAINING_CHARS}" ]]; then
+                cat /tmp/job_section.txt >> /tmp/failure_logs.txt
+                TOTAL_LINES=$(( TOTAL_LINES + JOB_SECTION_LINES ))
+                TOTAL_CHARS=$(( TOTAL_CHARS + JOB_SECTION_CHARS ))
+                INCLUDED_JOBS=$(( INCLUDED_JOBS + 1 ))
+              else
+                SKIPPED_JOBS=$(( SKIPPED_JOBS + 1 ))
+              fi
+
+              if [[ "${TOTAL_LINES}" -ge "${MAX_TOTAL_LINES}" || "${TOTAL_CHARS}" -ge "${MAX_TOTAL_CHARS}" ]]; then
+                break
+              fi
+            done <<< "${FAILED_JOBS}"
+
+            if [[ "${INCLUDED_JOBS}" -eq 0 ]]; then
+              {
+                echo "No failed-job error sections could be included without exceeding limits (4,000 lines / 30,000 chars)."
+                echo "Only complete error blocks are included (no partial error blocks)."
+              } > /tmp/failure_logs.txt
+            elif [[ "${SKIPPED_JOBS}" -gt 0 ]]; then
+              {
+                echo ""
+                echo "[NOTE] Skipped ${SKIPPED_JOBS} failed job(s) because no complete error blocks fit in the remaining budget."
+              } >> /tmp/failure_logs.txt
+            fi
+          fi
+
+          # ── Compute metrics from failed_jobs.json ──
+          FAILED_JOB_COUNT=$(jq 'length' /tmp/failed_jobs.json)
+          echo "failed_job_count=${FAILED_JOB_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "📊 Current failed job count: ${FAILED_JOB_COUNT}"
+
+          # Distinct error signatures: first non-empty line of each error block
+          ERROR_SIGS=$(grep -iE '(error|exception|traceback|fatal|failed|failure)' /tmp/failure_logs.txt \
+            | sed 's/^[[:space:]]*//' \
+            | sort -u \
+            | head -20 \
+            | jq -R -s 'split("\n") | map(select(length > 0))' \
+            || echo '[]')
+          ERROR_SIG_COUNT=$(echo "${ERROR_SIGS}" | jq 'length')
+          echo "error_signature_count=${ERROR_SIG_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "📊 Distinct error signatures: ${ERROR_SIG_COUNT}"
+
+          # Write metrics JSON for use in controller state
+          jq -n \
+            --argjson count "${FAILED_JOB_COUNT}" \
+            --argjson sig_count "${ERROR_SIG_COUNT}" \
+            --argjson sigs "${ERROR_SIGS}" \
+            '{failed_job_count: $count, error_signature_count: $sig_count, error_signatures: $sigs}' \
+            > /tmp/current_metrics.json
+
+          echo "::group::Current metrics"
+          cat /tmp/current_metrics.json
+          echo "::endgroup::"
+
+          # ── Expose as outputs via delimiter-safe heredocs ──
+          DELIM="GHEOF_$(openssl rand -hex 8)"
+
+          {
+            echo "failed_jobs<<${DELIM}"
+            cat /tmp/failed_jobs.json
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "log_snippet<<${DELIM}"
+            cat /tmp/failure_logs.txt
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "current_metrics<<${DELIM}"
+            cat /tmp/current_metrics.json
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── Step 5b: Read previous controller state ───────────────
+      - name: Read previous controller state
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        id: prev_state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Find the latest controller-state comment and extract the JSON block
+          STATE_BODY=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${CONTROLLER_STATE_MARKER}\"))] | last // empty | .body" \
+            || echo ''
+          )
+
+          STATE_JSON=""
+          if [[ -n "${STATE_BODY:-}" ]]; then
+            STATE_JSON=$(echo "${STATE_BODY}" | sed -n '/```json/,/```/{/```/d;p}' || echo '')
+          fi
+
+          if [[ -z "${STATE_JSON:-}" ]] || ! echo "${STATE_JSON}" | jq empty 2>/dev/null; then
+            echo "ℹ️  No previous controller state found. First tracked attempt."
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            echo "prev_failed_job_count=" >> "$GITHUB_OUTPUT"
+            echo "prev_error_signature_count=" >> "$GITHUB_OUTPUT"
+            echo "stall_streak=0" >> "$GITHUB_OUTPUT"
+          else
+            PREV_COUNT=$(echo "${STATE_JSON}" | jq -r '.failed_job_count // empty')
+            PREV_SIG_COUNT=$(echo "${STATE_JSON}" | jq -r '.error_signature_count // 0')
+            PREV_STALL=$(echo "${STATE_JSON}" | jq -r '.stall_streak // 0')
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+            echo "prev_failed_job_count=${PREV_COUNT}" >> "$GITHUB_OUTPUT"
+            echo "prev_error_signature_count=${PREV_SIG_COUNT}" >> "$GITHUB_OUTPUT"
+            echo "stall_streak=${PREV_STALL}" >> "$GITHUB_OUTPUT"
+            echo "📊 Previous state — failed_job_count: ${PREV_COUNT}, error_sig_count: ${PREV_SIG_COUNT}, stall_streak: ${PREV_STALL}"
+          fi
+
+      # ── Step 5c: Gate on improvement ──────────────────────────
+      - name: Check for improvement
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        id: improvement
+        env:
+          CURRENT_COUNT: ${{ steps.logs.outputs.failed_job_count }}
+          CURRENT_SIG_COUNT: ${{ steps.logs.outputs.error_signature_count }}
+          HAS_PREVIOUS: ${{ steps.prev_state.outputs.has_previous }}
+          PREV_COUNT: ${{ steps.prev_state.outputs.prev_failed_job_count }}
+          PREV_SIG_COUNT: ${{ steps.prev_state.outputs.prev_error_signature_count }}
+          PREV_STALL: ${{ steps.prev_state.outputs.stall_streak }}
+        run: |
+          set -euo pipefail
+
+          STALL_STREAK=0
+
+          if [[ "${HAS_PREVIOUS}" == "true" && -n "${PREV_COUNT:-}" ]]; then
+            IMPROVED=false
+
+            # Signal 1: fewer failed jobs
+            if [[ "${CURRENT_COUNT}" -lt "${PREV_COUNT}" ]]; then
+              echo "✅ Job count improved: ${PREV_COUNT} → ${CURRENT_COUNT}"
+              IMPROVED=true
+            fi
+
+            # Signal 2: fewer error signatures (even if job count is same)
+            if [[ "${CURRENT_SIG_COUNT}" -lt "${PREV_SIG_COUNT:-0}" ]]; then
+              echo "✅ Error signature count improved: ${PREV_SIG_COUNT} → ${CURRENT_SIG_COUNT}"
+              IMPROVED=true
+            fi
+
+            if [[ "${IMPROVED}" == "true" ]]; then
+              STALL_STREAK=0
+            else
+              STALL_STREAK=$(( PREV_STALL + 1 ))
+              echo "⚠️  No improvement:"
+              echo "    Jobs:      ${PREV_COUNT} → ${CURRENT_COUNT}"
+              echo "    Sig count: ${PREV_SIG_COUNT:-?} → ${CURRENT_SIG_COUNT}"
+              echo "    Stall streak: ${STALL_STREAK}/${MAX_STALL_ATTEMPTS}"
+            fi
+          else
+            echo "ℹ️  No previous data — baseline attempt."
+            STALL_STREAK=0
+          fi
+
+          echo "stall_streak=${STALL_STREAK}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${STALL_STREAK}" -ge "${MAX_STALL_ATTEMPTS}" ]]; then
+            echo "� Stall streak ${STALL_STREAK} ≥ threshold ${MAX_STALL_ATTEMPTS} — Copilot will receive escalated instructions."
+          fi
+
+      # ── Step 5d: Fetch gem change summary from PR ─────────────
+      - name: Fetch gem change summary
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        id: gem_summary
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # The dependabot-gem-review workflow posts a comment with "## Dependency change summary"
+          # Fetch it so we can include gem change context in the Copilot prompt
+          GEM_REVIEW_BODY=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq '[.[] | select(.body | contains("## Dependency change summary"))] | last // empty | .body' \
+            || echo ''
+          )
+
+          if [[ -z "${GEM_REVIEW_BODY:-}" ]]; then
+            echo "ℹ️  No gem review comment found on PR. Skipping gem summary."
+            echo "has_gem_summary=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Found gem review comment on PR #${PR_NUMBER}"
+            echo "has_gem_summary=true" >> "$GITHUB_OUTPUT"
+
+            # Write to file for safe multi-line output
+            echo "${GEM_REVIEW_BODY}" > /tmp/gem_summary.md
+
+            DELIM="GHEOF_$(openssl rand -hex 8)"
+            {
+              echo "gem_summary<<${DELIM}"
+              cat /tmp/gem_summary.md
+              echo "${DELIM}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 6: Build & post Copilot trigger comment ──────────
+      #
+      #   SECURITY NOTE: The comment body is written to a file and
+      #   posted via `--field body=@file` so that CI log content can
+      #   never be interpreted as shell code or GitHub expression.
+      # ────────────────────────────────────────────────────────────
+      - name: Build Copilot trigger comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+          HAS_PREVIOUS: ${{ steps.prev_state.outputs.has_previous }}
+          PREV_FAILED_JOB_COUNT: ${{ steps.prev_state.outputs.prev_failed_job_count }}
+          PREV_ERROR_SIG_COUNT: ${{ steps.prev_state.outputs.prev_error_signature_count }}
+          CURRENT_FAILED_JOB_COUNT: ${{ steps.logs.outputs.failed_job_count }}
+          CURRENT_ERROR_SIG_COUNT: ${{ steps.logs.outputs.error_signature_count }}
+          STALL_STREAK: ${{ steps.improvement.outputs.stall_streak }}
+          HAS_GEM_SUMMARY: ${{ steps.gem_summary.outputs.has_gem_summary }}
+          GEM_SUMMARY: ${{ steps.gem_summary.outputs.gem_summary }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${ATTEMPT}" -eq 1 ]]; then
+            HEADER="## 🤖 Copilot: Fix CI Failures (Attempt #${ATTEMPT})"
+            CONTEXT=$(cat <<FIRST_ATTEMPT
+          This is the **first** automated fix attempt.
+
+          ### ⚠️ Constraints (apply to ALL attempts)
+          - **Do not modify more than 10 files** in a single PR.
+          - **Do not add or remove gems** from the Gemfile; only adapt code and tests to the new gem versions from this Dependabot PR.
+          - **Do not downgrade any dependency** — work with the versions Dependabot introduced.
+          - **Keep your changes minimal** — only touch what is strictly necessary to make CI green.
+          - **Do not refactor unrelated code** or introduce new features, tests, or checks.
+          FIRST_ATTEMPT
+          )
+          elif [[ "${STALL_STREAK}" -ge "${MAX_STALL_ATTEMPTS}" ]]; then
+            HEADER="## 🚨 Copilot: ESCALATED — Fix CI Failures (Attempt #${ATTEMPT} of ${MAX_COPILOT_RETRIES})"
+            CONTEXT=$(cat <<ESCALATION
+          **⚠️ CRITICAL: Your previous ${STALL_STREAK} fix attempts made ZERO progress.** The same number of jobs and error signatures are still failing. Your prior approach is **not working**.
+
+          ### 🛑 MANDATORY: Change your strategy
+
+          1. **Stop touching the same files** unless the stack trace explicitly points to them. Your previous edits to those files did not help — doing it again will not help either.
+          2. **Trace the full call stack.** Follow the error stack traces end-to-end. The root cause is likely in a **different file or code path** than where the error surfaces. Look at callers, initializers, and config files upstream of the error.
+          3. **Read the gem's release notes.** Go to the upgraded gem's CHANGELOG, release notes, or migration guide. Look for:
+             - Renamed/removed methods or classes
+             - Changed method signatures (new required args, removed kwargs)
+             - Deprecated APIs that were finally removed
+             - New required configuration or initializer changes
+          4. **Consider these specific alternative strategies:**
+             - If you were editing **test files** → try editing the **source code** instead (or vice versa).
+             - If you were fixing **method signatures** → check if the **entire API contract** changed (class renamed, module restructured).
+             - If you were patching **one file** → check if a **config/initializer** or **monkey-patch** also needs updating.
+             - If the error is in a **dependency chain** → check if an intermediate gem also needs adaptation.
+          5. **You are fully responsible** for making CI green. Do not suggest manual intervention or ask the user to do anything.
+
+          ### ⚠️ Constraints (STRICTLY enforced for escalated attempts)
+          - **Do not modify more than 8 files** — you've been making changes that don't help; be more surgical.
+          - **Do not add or remove gems** from the Gemfile; only adapt code and tests to the new gem versions.
+          - **Do not downgrade any dependency.**
+          - **Do not re-apply any change you already made in a previous attempt.** Read your previous PRs first.
+          - **Do not refactor unrelated code** or introduce new features, tests, or checks.
+          ESCALATION
+          )
+          else
+            HEADER="## 🔄 Copilot: Retry Fix CI Failures (Attempt #${ATTEMPT} of ${MAX_COPILOT_RETRIES})"
+            CONTEXT=$(cat <<RETRY
+          Previous fix attempts did **not** fully resolve CI. Review what was already tried in earlier comments and PRs on this branch, then fix the **remaining** issues. Do **not** repeat changes that were already applied.
+
+          ### 🔍 Before you start
+          - **Read every previous Copilot fix PR** on this branch. Understand what was already changed and why it didn't fully work.
+          - **Check the gem's CHANGELOG or release notes** for the upgraded version — look for breaking changes, renamed methods, or removed APIs.
+          - **Trace the error stack traces** to find the actual root cause, not just the symptom.
+
+          ### ⚠️ Constraints (apply to ALL attempts)
+          - **Do not modify more than 10 files** in a single PR.
+          - **Do not add or remove gems** from the Gemfile; only adapt code and tests to the new gem versions from this Dependabot PR.
+          - **Do not downgrade any dependency.**
+          - **Do not re-apply changes** that were already tried in a previous attempt.
+          - **Do not refactor unrelated code** or introduce new features, tests, or checks.
+          RETRY
+          )
+          fi
+
+          # Read log artifacts produced by the previous step
+          FAILED_JOBS_JSON=$(cat /tmp/failed_jobs.json 2>/dev/null || echo '[]')
+          LOG_TEXT=$(cat /tmp/failure_logs.txt 2>/dev/null || echo 'No logs captured.')
+
+          cat > /tmp/copilot_comment.md <<COMMENT
+          ${COPILOT_MARKER}
+          @copilot
+
+          ${HEADER}
+
+          ${CONTEXT}
+
+          ---
+
+          Please take full ownership of fixing this Dependabot PR so that **all CI checks pass on this branch**.
+
+          ### Goal
+
+          - Analyze this Dependabot PR and the **current CI failures** on this branch.
+          - Make the minimal code-level changes needed so that this attempt’s failing jobs (listed below) pass. Do not try to fix unrelated jobs or introduce new checks
+          - Create a **new pull request that targets this Dependabot branch** with your fixes.
+          - After I merge your PR into this branch, CI on this branch should be **green with no failing jobs**.
+
+          ### Latest CI Failure Details
+
+          🔗 **Failing CI run:** ${RUN_URL}
+          🏗️ **Failed workflow:** ${WORKFLOW_NAME}
+          📊 **Attempt:** #${ATTEMPT} of ${MAX_COPILOT_RETRIES}
+          📉 **Failed job count:** ${CURRENT_FAILED_JOB_COUNT}
+          🔍 **Distinct error signatures:** ${CURRENT_ERROR_SIG_COUNT}
+
+          $(if [[ "${HAS_GEM_SUMMARY}" == "true" && -n "${GEM_SUMMARY:-}" ]]; then
+          cat <<GEM_BLOCK
+          ### 💎 Gem Changes in This Dependabot PR
+
+          > **Use this to understand what actually changed.** Map the errors above to the gem changes below.
+          > If a gem had a **major** bump, check its CHANGELOG/migration guide for breaking changes.
+          > If a gem had a **minor/patch** bump and errors reference it, check for deprecation removals.
+
+          ${GEM_SUMMARY}
+          GEM_BLOCK
+          fi)
+
+          $(if [[ -f /tmp/current_metrics.json ]]; then
+          SIGS=$(jq -r '.error_signatures[]' /tmp/current_metrics.json 2>/dev/null || echo '')
+          if [[ -n "${SIGS:-}" ]]; then
+          cat <<SIGS_BLOCK
+          **Detected error signatures (deduplicated):**
+          \`\`\`
+          ${SIGS}
+          \`\`\`
+
+          SIGS_BLOCK
+          fi
+          fi)
+
+          $(if [[ "${HAS_PREVIOUS}" == "true" && -n "${PREV_FAILED_JOB_COUNT:-}" ]]; then
+          cat <<METRICS_BLOCK
+          ### 📊 Progress vs Previous Attempt
+
+          | Metric | Previous (Attempt #$((ATTEMPT - 1))) | Current (Attempt #${ATTEMPT}) | Change |
+          |--------|---------|---------|--------|
+          | Failed jobs | ${PREV_FAILED_JOB_COUNT} | ${CURRENT_FAILED_JOB_COUNT} | $(if [[ "${CURRENT_FAILED_JOB_COUNT}" -lt "${PREV_FAILED_JOB_COUNT}" ]]; then echo "✅ Improved"; elif [[ "${CURRENT_FAILED_JOB_COUNT}" -eq "${PREV_FAILED_JOB_COUNT}" ]]; then echo "⚠️ No change"; else echo "❌ Regressed"; fi) |
+          | Error signatures | ${PREV_ERROR_SIG_COUNT:-?} | ${CURRENT_ERROR_SIG_COUNT} | $(if [[ "${CURRENT_ERROR_SIG_COUNT}" -lt "${PREV_ERROR_SIG_COUNT:-0}" ]]; then echo "✅ Improved"; elif [[ "${CURRENT_ERROR_SIG_COUNT}" -eq "${PREV_ERROR_SIG_COUNT:-0}" ]]; then echo "⚠️ No change"; else echo "❌ Regressed"; fi) |
+          | Stall streak | — | ${STALL_STREAK} / ${MAX_STALL_ATTEMPTS} | $(if [[ "${STALL_STREAK}" -eq 0 ]]; then echo "✅ Reset"; else echo "⚠️ No progress"; fi) |
+
+          > **⚠️ If the above metrics show no improvement, your approach from the previous attempt did not work. Try a fundamentally different fix strategy.**
+          METRICS_BLOCK
+          fi)
+
+          **Failed jobs:**
+          \`\`\`json
+          ${FAILED_JOBS_JSON}
+          \`\`\`
+
+          **Failure log excerpt (failed jobs, complete error blocks only, max 4,000 lines and ~30,000 chars):**
+          \`\`\`
+          ${LOG_TEXT}
+          \`\`\`
+
+          ### How to work
+
+          **As your very first action**, post a single comment on this PR with the checklist below (copy it exactly).
+          Then **edit that same comment** to check off each item as you complete it, adding a short summary next to the checkbox.
+          If a progress comment with marker ${COPILOT_PROGRESS_MARKER} already exists, **reuse and update that same comment** instead of creating a new one.
+          Do **not** post separate progress comments for each step or each retry — keep everything in one persistent checklist thread.
+          After **every step**, immediately update that same checklist comment with a clear status note (Done / In progress / Blocked + one-line reason).
+          If you intentionally skip a step, check it off and write \`Skipped: <reason>\` next to it.
+
+          \`\`\`markdown
+          ${COPILOT_PROGRESS_MARKER}
+          ### 🤖 Copilot Fix Progress
+
+          - [ ] **Step 1 — Understand the failures:**
+          - [ ] **Step 2 — Plan and apply fixes:**
+          - [ ] **Step 3 — Run the full test suite:**
+          - [ ] **Step 4 — Create the fix PR:**
+          - [ ] **Step 5 — Iterate until green:**
+          - [ ] **Ready to merge ✅**
+          \`\`\`
+
+          #### Step details
+
+          1. **Understand the failures**
+             - Read the failure logs above carefully.
+             - Also check the full CI run at the link above for complete context.
+             - Identify the **exact errors** (e.g., failing test cases, missing dependencies, schema mismatches, etc.).
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary of what failed and why.
+
+          2. **Plan and apply fixes**
+             - Update or remove specs, code, config, or CI steps as needed.
+             - Do **not** downgrade the dependencies; keep the versions from this Dependabot PR and adapt the code/config to them.
+             - Keep changes **minimal and focused** only on what is needed to get CI green.
+             - If this is a retry, check what was already changed in previous fix PRs and build on top of those changes.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary of the changes you applied.
+
+          3. **Run the full test suite in your environment**
+             - Run the full suite in your ephemeral environment:
+               \`\`\`bash
+               bin/rails test
+               \`\`\`
+             - If they still fail, **iterate on your changes and re-run** until they pass or you hit a hard blocker.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary of test results (pass/fail and why).
+
+          4. **Create the PR to this branch**
+             - Open a new PR **from your Copilot branch into this Dependabot branch**.
+             - Title the PR: \`AI GEM UPGRADE\`
+             - Include a clear description explaining:
+               - What broke and why.
+               - Exactly what files you changed and why those changes fix the CI failures.
+               - What attempt number this is.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a link to the PR you opened.
+
+          5. **You are only responsible for the jobs that were failing in this attempt. If other jobs are still failing, leave them and explain in your checklist comment.**
+             - Keep iterating within this session until:
+               - The tests and CI commands you run are passing, **and**
+               - You are confident that merging your PR into this branch will let the GitHub CI checks pass as well.
+             - If you hit a hard blocker you truly cannot solve, explain clearly what is blocking you.
+             - ✏️ Status update required: immediately edit your checklist after this step and add a one-line summary confirming CI is green or explaining the blocker.
+
+          6. **Final sign-off**
+             - Once all steps above are done and CI is passing, check off the last item: **Ready to merge ✅**.
+             - This signals that your fix PR is complete and safe to merge into the Dependabot branch.
+
+          ---
+          _This comment was auto-generated by the Dependabot CI fix automation (attempt #${ATTEMPT})._
+          COMMENT
+
+      - name: Post Copilot trigger comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/copilot_comment.md
+
+          echo "✅ Posted Copilot trigger comment (attempt #${ATTEMPT}) on PR #${PR_NUMBER}"
+
+      # ── Step 7: Label the Dependabot PR ───────────────────────
+      - name: Add label to Dependabot PR
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Ensure the label exists (idempotent)
+          gh api "repos/${REPO}/labels" \
+            --method POST \
+            --field name="copilot-ci-fix-requested" \
+            --field color="1d76db" \
+            --field description="Copilot has been asked to fix CI on this PR" \
+            2>/dev/null || true
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --method POST \
+            --input - <<< '{"labels":["copilot-ci-fix-requested"]}'
+
+      # ── Step 7b: Persist controller state ─────────────────────
+      #
+      #   Always runs after metrics are computed (even when stalled)
+      #   so the state comment reflects the latest data.
+      # ────────────────────────────────────────────────────────────
+      - name: Persist controller state
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+          CURRENT_COUNT: ${{ steps.logs.outputs.failed_job_count }}
+          ERROR_SIG_COUNT: ${{ steps.logs.outputs.error_signature_count }}
+          STALL_STREAK: ${{ steps.improvement.outputs.stall_streak }}
+        run: |
+          set -euo pipefail
+
+          # Build the state JSON
+          STATE_JSON=$(jq -n \
+            --argjson attempt "${ATTEMPT}" \
+            --argjson failed_job_count "${CURRENT_COUNT}" \
+            --argjson error_signature_count "${ERROR_SIG_COUNT}" \
+            --argjson stall_streak "${STALL_STREAK}" \
+            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              attempt: $attempt,
+              failed_job_count: $failed_job_count,
+              error_signature_count: $error_signature_count,
+              stall_streak: $stall_streak,
+              updated_at: $updated_at
+            }')
+
+          cat > /tmp/controller_state_comment.md <<STATE_EOF
+          ${CONTROLLER_STATE_MARKER}
+          ### 📈 Copilot Controller State (attempt #${ATTEMPT})
+
+          > **Do not edit this comment** — it is used by the automation to track progress.
+
+          \`\`\`json
+          ${STATE_JSON}
+          \`\`\`
+
+          | Metric | Value |
+          |--------|-------|
+          | Attempt | #${ATTEMPT} |
+          | Failed jobs | ${CURRENT_COUNT} |
+          | Error signatures | ${ERROR_SIG_COUNT} |
+          | Stall streak | ${STALL_STREAK} / ${MAX_STALL_ATTEMPTS} |
+          STATE_EOF
+
+          # Find existing controller state comment to update (or create new)
+          EXISTING_COMMENT_ID=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${CONTROLLER_STATE_MARKER}\"))] | last // empty | .id" \
+            || echo ''
+          )
+
+          if [[ -n "${EXISTING_COMMENT_ID:-}" && "${EXISTING_COMMENT_ID}" != "null" ]]; then
+            # Update existing comment in-place
+            gh api "repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
+              --method PATCH \
+              --field body=@/tmp/controller_state_comment.md
+            echo "📝 Updated controller state comment (id: ${EXISTING_COMMENT_ID})"
+          else
+            # Create new controller state comment
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --field body=@/tmp/controller_state_comment.md
+            echo "📝 Created controller state comment on PR #${PR_NUMBER}"
+          fi
+
+      # ── Step 8: Auto-approve pending Copilot workflows ────────
+      - name: Auto-approve pending workflows on Copilot PRs
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        run: |
+          set -euo pipefail
+
+          echo "ℹ️  Auto-approval of workflow runs has been disabled for security reasons."

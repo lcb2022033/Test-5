@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "bundler"
+    directory: "/"           # Gemfile at repo root
+    schedule:
+      interval: "daily"      # Testing: daily updates
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 0
+    labels:
+      - "dependabot"
+      - "dependencies"

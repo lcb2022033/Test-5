@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - "*"
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure Rails binstub is executable
+        run: chmod +x bin/rails
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Run Tests
+        run: |
+          bin/rails test:prepare
+          bin/rails test
