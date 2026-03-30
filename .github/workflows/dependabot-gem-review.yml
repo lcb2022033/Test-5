@@ -1,12 +1,11 @@
 name: Gem Upgrade Review
 
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize]
-    paths:
-      - "Gemfile"
-      - "Gemfile.lock"
-      - "*.gemspec"
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches:
+      - 'dependabot/**'
 
 permissions:
   contents: read
@@ -15,36 +14,81 @@ permissions:
   
 jobs:
   review-gems:
-    if: github.actor == 'dependabot[bot]'
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
     runs-on: ubuntu-latest
     env:
       GEM_REVIEW_PATH: gem_review.md
 
     steps:
+      - name: Resolve Dependabot PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          PR_DATA=$(gh api "repos/${REPO}/pulls" \
+            --method GET \
+            -f head="${REPO%%/*}:${BRANCH}" \
+            -f state=open \
+            --jq '.[0] // empty')
+
+          if [[ -z "${PR_DATA:-}" ]]; then
+            echo "No open PR found for branch ${BRANCH}; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_NUMBER=$(echo "${PR_DATA}" | jq -r '.number')
+          PR_AUTHOR=$(echo "${PR_DATA}" | jq -r '.user.login')
+          BASE_SHA=$(echo "${PR_DATA}" | jq -r '.base.sha')
+          BASE_REF=$(echo "${PR_DATA}" | jq -r '.base.ref')
+
+          if [[ "${PR_AUTHOR}" != "dependabot[bot]" ]]; then
+            echo "PR #${PR_NUMBER} author is ${PR_AUTHOR}, not dependabot[bot]; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout base branch (trusted code)
+        if: steps.pr.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 0  
+          ref: ${{ steps.pr.outputs.base_sha }}
+          fetch-depth: 0
 
       - name: Set up Ruby
+        if: steps.pr.outputs.skip != 'true'
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.3.0"   
+          ruby-version: "3.3.0"
           bundler-cache: false
 
       - name: Fetch PR Gemfile.lock safely
+        if: steps.pr.outputs.skip != 'true'
         run: |
-          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-branch
+          git fetch origin pull/${{ steps.pr.outputs.pr_number }}/head:pr-branch
           git show pr-branch:Gemfile.lock > pr_gemfile.lock
 
-
       - name: Generate dependency review comment
+        if: steps.pr.outputs.skip != 'true'
         run: ruby .github/scripts/gem_diff.rb
         env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
           PR_GEMFILE_LOCK_PATH: pr_gemfile.lock
 
       - name: Verify gem_review.md exists
+        if: steps.pr.outputs.skip != 'true'
         run: |
           test -f "$GEM_REVIEW_PATH"
           test -s "$GEM_REVIEW_PATH"
@@ -52,10 +96,26 @@ jobs:
           cat "$GEM_REVIEW_PATH"
           echo "=== end ==="
 
-      - name: Comment on PR with dependency summary
-        if: github.event.pull_request != null
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          token: ${{ github.token }}
-          issue-number: ${{ github.event.pull_request.number }}
-          body-file: ${{ env.GEM_REVIEW_PATH }}
+      - name: Upsert dependency summary comment
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          EXISTING_COMMENT_ID=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.body | contains("## Dependency change summary"))] | last // empty | .id' \
+            || echo '')
+
+          if [[ -n "${EXISTING_COMMENT_ID:-}" && "${EXISTING_COMMENT_ID}" != "null" ]]; then
+            gh api "repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
+              --method PATCH \
+              --field body=@${GEM_REVIEW_PATH}
+            echo "Updated dependency summary comment ${EXISTING_COMMENT_ID}."
+          else
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --field body=@${GEM_REVIEW_PATH}
+            echo "Created dependency summary comment on PR #${PR_NUMBER}."
+          fi

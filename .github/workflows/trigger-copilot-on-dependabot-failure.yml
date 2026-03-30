@@ -526,6 +526,7 @@ jobs:
           HAS_PREVIOUS: ${{ steps.prev_state.outputs.has_previous }}
           PREV_FAILED_JOB_COUNT: ${{ steps.prev_state.outputs.prev_failed_job_count }}
           PREV_ERROR_SIG_COUNT: ${{ steps.prev_state.outputs.prev_error_signature_count }}
+          PREV_STALL: ${{ steps.prev_state.outputs.stall_streak }}
           CURRENT_FAILED_JOB_COUNT: ${{ steps.logs.outputs.failed_job_count }}
           CURRENT_ERROR_SIG_COUNT: ${{ steps.logs.outputs.error_signature_count }}
           STALL_STREAK: ${{ steps.improvement.outputs.stall_streak }}
@@ -583,6 +584,12 @@ jobs:
 
           ${GEM_SUMMARY}
           GEM_BLOCK
+          else
+          cat <<GEM_FALLBACK
+          ### 💎 Gem Changes
+
+          Gem summary not available (gem-review comment was skipped while CI is failing).
+          GEM_FALLBACK
           fi)
 
           $(if [[ -f /tmp/current_metrics.json ]]; then
@@ -601,6 +608,16 @@ jobs:
           ${SIGS}
           ```
           SIGS_BLOCK
+          fi)
+          $(if [[ "${HAS_PREVIOUS}" == "true" && -n "${PREV_FAILED_JOB_COUNT:-}" ]]; then
+          cat <<HISTORY_BLOCK
+
+          **Previous attempt metrics:**
+
+          | Attempt | Failed jobs | Error signatures | Stall streak |
+          |---------|-------------|------------------|--------------|
+          | $((ATTEMPT-1)) | ${PREV_FAILED_JOB_COUNT} | ${PREV_ERROR_SIG_COUNT:-?} | ${PREV_STALL} |
+          HISTORY_BLOCK
           fi)
           METRICS_BLOCK
           fi)
@@ -692,8 +709,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build the state JSON
-          STATE_JSON=$(jq -n \
+          CURRENT_ENTRY=$(jq -n \
             --argjson attempt "${ATTEMPT}" \
             --argjson failed_job_count "${CURRENT_COUNT}" \
             --argjson error_signature_count "${ERROR_SIG_COUNT}" \
@@ -706,6 +722,43 @@ jobs:
               stall_streak: $stall_streak,
               updated_at: $updated_at
             }')
+
+          # Merge with previous controller state history (if any)
+          PREV_STATE_BODY=$(
+            gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${CONTROLLER_STATE_MARKER}\"))] | last // empty | .body" \
+            || echo ''
+          )
+
+          PREV_STATE_JSON="{}"
+          if [[ -n "${PREV_STATE_BODY:-}" ]]; then
+            EXTRACTED=$(echo "${PREV_STATE_BODY}" | sed -n '/```json/,/```/{/```/d;p}' || echo '')
+            if [[ -n "${EXTRACTED:-}" ]] && echo "${EXTRACTED}" | jq empty 2>/dev/null; then
+              PREV_STATE_JSON="${EXTRACTED}"
+            fi
+          fi
+
+          # Keep top-level latest metrics plus append/update per-attempt history
+          STATE_JSON=$(jq -n \
+            --argjson prev "${PREV_STATE_JSON}" \
+            --argjson current "${CURRENT_ENTRY}" \
+            '{
+              attempt: $current.attempt,
+              failed_job_count: $current.failed_job_count,
+              error_signature_count: $current.error_signature_count,
+              stall_streak: $current.stall_streak,
+              updated_at: $current.updated_at,
+              history: (((($prev.history // []) | map(select(.attempt != $current.attempt))) + [$current]) | sort_by(.attempt))
+            }')
+
+          HISTORY_TABLE=$(echo "${STATE_JSON}" | jq -r '
+            (.history // []) as $h |
+            if ($h | length) == 0 then ""
+            else
+              "| Attempt | Failed jobs | Error signatures | Stall streak | Updated |\n|---------|-------------|------------------|--------------|---------|\n" +
+              ($h | map("| #\(.attempt) | \(.failed_job_count) | \(.error_signature_count) | \(.stall_streak) | \(.updated_at // \"-\") |") | join("\n"))
+            end
+          ')
 
           cat > /tmp/controller_state_comment.md <<STATE_EOF
           ${CONTROLLER_STATE_MARKER}
@@ -723,6 +776,10 @@ jobs:
           | Failed jobs | ${CURRENT_COUNT} |
           | Error signatures | ${ERROR_SIG_COUNT} |
           | Stall streak | ${STALL_STREAK} / ${MAX_STALL_ATTEMPTS} |
+
+          ### Attempt History
+
+          ${HISTORY_TABLE}
           STATE_EOF
 
           # Find existing controller state comment to update (or create new)

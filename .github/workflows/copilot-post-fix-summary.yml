@@ -11,7 +11,7 @@ name: copilot-post-fix-summary
 # ──────────────────────────────────────────────────────────────
 on:
   workflow_run:
-    workflows: ["Run Rspec", "Run RuboCop"]
+    workflows: ["Tests"]
     types: [completed]
     branches:
       - 'dependabot/**'
@@ -172,6 +172,23 @@ jobs:
           echo "final_error_sigs=${FINAL_ERROR_SIGS}" >> "$GITHUB_OUTPUT"
           echo "final_stall_streak=${FINAL_STALL_STREAK}" >> "$GITHUB_OUTPUT"
 
+          # Build attempt evolution table from controller history (if present)
+          ATTEMPT_EVOLUTION_TABLE=$(jq -r '
+            (.history // []) as $h |
+            if ($h | length) == 0 then "No attempt history captured."
+            else
+              "| Attempt | Failed jobs | Error signatures | Stall streak | Updated |\n|---------|-------------|------------------|--------------|---------|\n" +
+              ($h | map("| #\(.attempt) | \(.failed_job_count) | \(.error_signature_count) | \(.stall_streak) | \(.updated_at // \"-\") |") | join("\n"))
+            end
+          ' /tmp/final_state.json)
+
+          DELIM="GHEOF_$(openssl rand -hex 8)"
+          {
+            echo "attempt_evolution<<${DELIM}"
+            echo "${ATTEMPT_EVOLUTION_TABLE}"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
           # ── 4c: Fetch gem change summary ──
           GEM_SUMMARY=$(
             gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
@@ -218,7 +235,7 @@ jobs:
           # Extract error signatures block from the last trigger comment
           LAST_ERRORS=""
           if [[ -n "${LAST_TRIGGER:-}" ]]; then
-            LAST_ERRORS=$(echo "${LAST_TRIGGER}" | sed -n '/Detected error signatures/,/```/{/```/!p}' | sed '/Detected error signatures/d' || echo '')
+            LAST_ERRORS=$(echo "${LAST_TRIGGER}" | sed -n '/Current error signatures:/,/```/{/```/!p}' | sed '/Current error signatures:/d' || echo '')
           fi
 
           if [[ -n "${LAST_ERRORS:-}" ]]; then
@@ -230,7 +247,7 @@ jobs:
           # ── 4f: Extract failed jobs from the last trigger comment ──
           LAST_FAILED_JOBS=""
           if [[ -n "${LAST_TRIGGER:-}" ]]; then
-            LAST_FAILED_JOBS=$(echo "${LAST_TRIGGER}" | sed -n '/Failed jobs:/,/```/{/```/!p}' | sed '/Failed jobs:/d' | head -50 || echo '')
+            LAST_FAILED_JOBS=$(echo "${LAST_TRIGGER}" | sed -n '/Current failed jobs:/,/```/{/```/!p}' | sed '/Current failed jobs:/d' | head -50 || echo '')
           fi
 
           if [[ -n "${LAST_FAILED_JOBS:-}" ]]; then
@@ -290,6 +307,7 @@ jobs:
           HAS_PROGRESS: ${{ steps.gather.outputs.has_progress }}
           FIX_PR_COUNT: ${{ steps.gather.outputs.fix_pr_count }}
           TOTAL_FILES_CHANGED: ${{ steps.gather.outputs.total_files_changed }}
+          ATTEMPT_EVOLUTION: ${{ steps.gather.outputs.attempt_evolution }}
         run: |
           set -euo pipefail
 
@@ -354,6 +372,12 @@ jobs:
           | Failed jobs | ${FINAL_FAILED_JOBS} |
           | Error signatures | ${FINAL_ERROR_SIGS} |
           | Stall streak | ${FINAL_STALL_STREAK} |
+
+          ---
+
+          ### 📈 Attempt-by-Attempt Evolution
+
+          ${ATTEMPT_EVOLUTION}
 
           ---
 

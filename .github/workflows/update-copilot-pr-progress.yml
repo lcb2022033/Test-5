@@ -150,7 +150,7 @@ jobs:
 
           if [[ "${FAILING_INT}" -eq 0 && "${PENDING_INT}" -eq 0 && "${TOTAL_INT}" -gt 0 ]]; then
             READY_EMOJI="✅"
-            READY_HEADER="Ready to Merge"
+            READY_HEADER="Ready for review"
             READY_MSG="All CI checks have passed. This PR can be merged into the Dependabot branch."
             MERGE_STEP="- [x] 🎉 Merge this PR into the Dependabot branch"
           elif [[ "${FAILING_INT}" -gt 0 ]]; then
