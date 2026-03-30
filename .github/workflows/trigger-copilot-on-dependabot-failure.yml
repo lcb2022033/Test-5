@@ -209,89 +209,25 @@ jobs:
               REMAINING_JOB_LINES=$(( REMAINING_LINES - HEADER_LINES ))
               REMAINING_JOB_CHARS=$(( REMAINING_CHARS - HEADER_CHARS ))
 
-              awk -v max_lines="${REMAINING_JOB_LINES}" -v max_chars="${REMAINING_JOB_CHARS}" '
-                BEGIN {
-                  IGNORECASE=1
-                  in_block=0
-                  block_count=0
-                  found_any=0
-                  included_any=0
-                  total_lines=0
-                  total_chars=0
-                  truncated=0
-                }
+                : > /tmp/job_body.txt
+                BODY_LINES=0
+                BODY_CHARS=0
 
-                function block_chars(  i, c) {
-                  c=0
-                  for (i = 1; i <= block_count; i++) c += length(block[i]) + 1
-                  return c
-                }
-
-                function flush_block(  i, block_lines, block_chars_count) {
-                  if (block_count == 0) return
-
-                  block_lines = block_count + 1
-                  block_chars_count = block_chars() + 1
-
-                  if ((total_lines + block_lines) <= max_lines && (total_chars + block_chars_count) <= max_chars) {
-                    for (i = 1; i <= block_count; i++) print block[i]
-                    print ""
-                    total_lines += block_lines
-                    total_chars += block_chars_count
-                    included_any=1
-                  } else {
-                    truncated=1
-                  }
-
-                  delete block
-                  block_count=0
-                }
-
-                {
-                  line = $0
-
-                  if (line ~ /(error|exception|traceback|fatal|failed|failure)/) {
-                    found_any=1
-                    if (!in_block) {
-                      in_block=1
-                      block_count=0
-                    }
-                    block[++block_count] = line
-                    next
-                  }
-
-                  if (in_block) {
-                    if (line ~ /^$/ || line ~ /^##\[group\]/ || line ~ /^##\[endgroup\]/ || line ~ /^\+\s*\w/) {
-                      flush_block()
-                      in_block=0
-                      next
-                    }
-                    block[++block_count] = line
-                    next
-                  }
-                }
-
-                END {
-                  if (in_block) flush_block()
-
-                  if (!found_any) {
-                    print "No error-pattern blocks found for this job."
-                    print ""
-                  } else if (!included_any) {
-                    print "No complete error block could fit within the remaining size budget for this job."
-                    print ""
-                  }
-
-                  if (truncated) {
-                    print "[NOTE] Additional error blocks were omitted to stay within size limits."
-                    print ""
-                  }
-                }
-              ' /tmp/failed_job_full.log > /tmp/job_error_blocks.txt
+                while IFS= read -r LINE; do
+                  LINE_LEN=${#LINE}
+                  if [[ $((BODY_LINES + 1)) -gt ${REMAINING_JOB_LINES} || $((BODY_CHARS + LINE_LEN + 1)) -gt ${REMAINING_JOB_CHARS} ]]; then
+                    echo "[NOTE] Log truncated to stay within size limits (${REMAINING_JOB_LINES} lines / ${REMAINING_JOB_CHARS} chars)." >> /tmp/job_body.txt
+                    break
+                  fi
+                  echo "${LINE}" >> /tmp/job_body.txt
+                  BODY_LINES=$((BODY_LINES + 1))
+                  BODY_CHARS=$((BODY_CHARS + LINE_LEN + 1))
+                done < /tmp/failed_job_full.log
 
               {
                 cat /tmp/job_header.txt
-                cat /tmp/job_error_blocks.txt
+                cat /tmp/job_body.txt
+                echo ""
               } > /tmp/job_section.txt
 
               JOB_SECTION_LINES=$(wc -l < /tmp/job_section.txt | tr -d ' ')
