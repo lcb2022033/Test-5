@@ -481,7 +481,11 @@ jobs:
 
           # Read log artifacts produced by the previous step
           FAILED_JOBS_JSON=$(cat /tmp/failed_jobs.json 2>/dev/null || echo '[]')
-          LOG_TEXT=$(cat /tmp/failure_logs.txt 2>/dev/null || echo 'No logs captured.')
+          if [[ -s /tmp/failure_logs.txt ]]; then
+            LOG_TEXT=$(cat /tmp/failure_logs.txt)
+          else
+            LOG_TEXT="No failure logs captured. Check the CI run for details."
+          fi
 
           cat > /tmp/copilot_comment.md <<COMMENT
           ${COPILOT_MARKER}
